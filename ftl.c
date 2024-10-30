@@ -1,29 +1,29 @@
 #include "ftl.h"
-#include <stdint.h>
-#include <stdio.h>
-#include <time.h>
+#include <stdint.h> // for uint64_t
+#include <stdio.h> // for fprintf
+#include <time.h> // for time()
 
 static time_t default_time = 0;
 // 로그를 위한 시간 기반 트리거
 static time_t last_second = 0;
 static time_t last_ten_seconds = 0;
-static uint64_t io_count = 0;
-static uint64_t data_transferred = 0;
-static uint64_t erased_blocks_cnt = 0;
+static uint64_t IOPS = 0;
+static uint64_t throughput = 0;
+static uint64_t erased_blocks = 0;
 static uint64_t valid_pages_moved = 0;
 
 // IOPS, 처리량을 매 초마다, GC와 valid_page 이동횟수 출력하는 헬퍼 함수
-static void print_log() {
+static void print_log(void) {
     time_t current_time = time(NULL);
     if (current_time > last_second) { // 1초가 경과했을 때
-        fprintf(stderr, "%ld,%lu,%.2f,%lu,%lu\n", current_time - default_time, io_count, data_transferred / 1024.0 / 1024.0, erased_blocks_cnt, valid_pages_moved);
+        fprintf(stderr, "%ld,%lu,%.2f,%lu,%lu\n", current_time - default_time, IOPS, throughput / 1024.0 / 1024.0, erased_blocks, valid_pages_moved);
         // 다음 간격을 위해 카운터 리셋
-        io_count = 0;
-        data_transferred = 0;
+        IOPS = 0;
+        throughput = 0;
         last_second = current_time;
         // 다음 간격을 위해 지워진 블록 수 리셋
         if (current_time - last_ten_seconds >= 10){
-            erased_blocks_cnt = 0;
+            erased_blocks = 0;
             valid_pages_moved = 0;
             last_ten_seconds = current_time;
         }
@@ -642,8 +642,8 @@ static void mark_block_free(struct ssd *ssd, struct ppa *ppa)
     blk->ipc = 0;
     blk->vpc = 0;
     blk->erase_cnt++;
-    erased_blocks_cnt++;
-    log_gc_performance();
+    erased_blocks++;
+    print_log();
 }
 
 static void gc_read_page(struct ssd *ssd, struct ppa *ppa)
@@ -835,8 +835,8 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
         sublat = ssd_advance_status(ssd, &ppa, &srd);
         maxlat = (sublat > maxlat) ? sublat : maxlat;
     }
-    io_count++;
-    data_transferred += req->nlb * ssd->sp.secsz;
+    IOPS++;
+    throughput += req->nlb * ssd->sp.secsz;
     print_log();
     return maxlat;
 }
@@ -892,8 +892,8 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         curlat = ssd_advance_status(ssd, &ppa, &swr);
         maxlat = (curlat > maxlat) ? curlat : maxlat;
     }
-    io_count++;
-    data_transferred += req->nlb * ssd->sp.secsz;
+    IOPS++;
+    throughput += req->nlb * ssd->sp.secsz;
     print_log();
     return maxlat;
 }
