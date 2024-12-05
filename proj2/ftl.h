@@ -2,7 +2,8 @@
 #define __FEMU_FTL_H
 
 #include "../nvme.h"
-
+extern uint64_t hot_cold_threshold;
+extern uint64_t *access_count_table;
 #define INVALID_PPA     (~(0ULL))
 #define INVALID_LPN     (~(0ULL))
 #define UNMAPPED_PPA    (~(0ULL))
