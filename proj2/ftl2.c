@@ -1,6 +1,5 @@
 #include "ftl.h"
 #include <stdint.h> // for uint64_t
-#include <stdio.h> // for fprintf
 #include <time.h> // for time()
 
 static time_t default_time = 0;
@@ -8,23 +7,18 @@ static time_t default_time = 0;
 static time_t last_ten_seconds = 0;
 static uint64_t IOPS = 0;
 static uint64_t throughput = 0;
-// static uint64_t erased_blocks = 0;
 static uint64_t valid_pages_moved = 0;
 
-uint64_t hot_cold_threshold = A, B, C;
 // IOPS, 처리량을 매 초마다, GC와 valid_page 이동횟수 출력하는 헬퍼 함수
 static void print_log(void) {
     time_t current_time = time(NULL);
     if (current_time - last_ten_seconds >= 10){
-        uint64_t total_write = throughput / ssd->sp.secsz;   // Host Write
-        uint64_t internal_write = valid_pages_moved;         // SSD 내부 Write
-        double waf = (double)(total_write + internal_write) / total_write;
-        fprintf(stderr, "%ld,%lu,%.2f,...\n", current_time - default_time, IOPS, waf);
+        double waf = (double)(throughput + valid_pages_moved) / throughput;
+        fprintf(stderr, "%ld,%lu,%.2f\n", current_time - default_time, IOPS, waf);
         IOPS = 0;
         throughput = 0;
-        // erased_blocks = 0;
         valid_pages_moved = 0;
-        last_second = current_time;
+        last_ten_seconds = current_time;
     }
 }
 
@@ -640,8 +634,6 @@ static void mark_block_free(struct ssd *ssd, struct ppa *ppa)
     blk->ipc = 0;
     blk->vpc = 0;
     blk->erase_cnt++;
-    // erased_blocks++;
-    print_log();
 }
 
 static void gc_read_page(struct ssd *ssd, struct ppa *ppa)
@@ -834,7 +826,7 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
         maxlat = (sublat > maxlat) ? sublat : maxlat;
     }
     IOPS++;
-    throughput += req->nlb * ssd->sp.secsz;
+    throughput += req->nlb;
     print_log();
     return maxlat;
 }
@@ -863,8 +855,6 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
     }
 
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
-// ssd_write에서만 LPN 접근 횟수 업데이트
-        access_count_table[lpn]++;
         ppa = get_maptbl_ent(ssd, lpn);
         if (mapped_ppa(&ppa)) {
             /* update old page information first */

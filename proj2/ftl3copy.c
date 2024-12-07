@@ -2,9 +2,29 @@
 #include <stdint.h> // for uint64_t
 #include <time.h> // for time()
 
-// 분포 count할 배열
+static time_t default_time = 0;
 uint32_t *access_count_table = NULL;
-// LPN 접근 횟수 테이블 초기화
+// 로그를 위한 시간 기반 트리거
+static time_t last_ten_seconds = 0;
+static uint64_t IOPS = 0;
+static uint64_t throughput = 0;
+static uint64_t valid_pages_moved = 0;
+
+uint64_t hot_cold_threshold = A, B, C;
+// IOPS, 처리량을 매 초마다, GC와 valid_page 이동횟수 출력하는 헬퍼 함수
+static void print_log(void) {
+    time_t current_time = time(NULL);
+    if (current_time - last_ten_seconds >= 10){
+        uint64_t total_write = throughput / ssd->sp.secsz;   // Host Write
+        uint64_t internal_write = valid_pages_moved;         // SSD 내부 Write
+        double waf = (double)(total_write + internal_write) / total_write;
+        stderr("%ld,%lu,%.2f,...\n", current_time - default_time, IOPS, waf);
+        IOPS = 0;
+        throughput = 0;
+        valid_pages_moved = 0;
+        last_ten_seconds = current_time;
+    }
+}
 static void ssd_init_access_count_table(struct ssd *ssd) {
     access_count_table = calloc(ssd->sp.tt_pgs, sizeof(uint32_t));
     if (!access_count_table) {
@@ -25,6 +45,8 @@ static void femu_exit(struct ssd *ssd) {
     print_lpn_access_distribution(ssd); // LPN 분포 출력
     free(access_count_table); // 메모리 해제
 }
+
+//#define FEMU_DEBUG_FTL
 
 static void *ftl_thread(void *arg);
 
@@ -666,6 +688,10 @@ static uint64_t gc_write_page(struct ssd *ssd, struct ppa *old_ppa)
     set_rmap_ent(ssd, lpn, &new_ppa);
 
     mark_page_valid(ssd, &new_ppa);
+    
+    /* Increment the valid pages moved counter 이부분만 추가*/ 
+    valid_pages_moved++;
+    print_log();
 
     /* need to advance the write pointer here */
     ssd_advance_write_pointer(ssd);
@@ -824,6 +850,9 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
         sublat = ssd_advance_status(ssd, &ppa, &srd);
         maxlat = (sublat > maxlat) ? sublat : maxlat;
     }
+    IOPS++;
+    throughput += req->nlb * ssd->sp.secsz;
+    print_log();
     return maxlat;
 }
 
@@ -851,10 +880,6 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
     }
 
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
-// ssd_write에서만 LPN 접근 횟수 업데이트
-        if (access_count_table)
-            access_count_table[lpn]++;
-
         ppa = get_maptbl_ent(ssd, lpn);
         if (mapped_ppa(&ppa)) {
             /* update old page information first */
@@ -882,6 +907,9 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         curlat = ssd_advance_status(ssd, &ppa, &swr);
         maxlat = (curlat > maxlat) ? curlat : maxlat;
     }
+    IOPS++;
+    throughput += req->nlb * ssd->sp.secsz;
+    print_log();
     return maxlat;
 }
 
@@ -894,6 +922,7 @@ static void *ftl_thread(void *arg)
     int rc;
     int i;
 
+    default_time = time(NULL);
     while (!*(ssd->dataplane_started_ptr)) {
         usleep(100000);
     }
@@ -907,11 +936,11 @@ static void *ftl_thread(void *arg)
     while (1) {
 // FEMU 종료 예상 시간 추적
         time_t elapsed_time = time(NULL) - start_time;
-        if (elapsed_time >= 400) { // FIO runtime (300초) 종료 시점 감지
+        if (elapsed_time >= 600) { // FIO runtime (300초) 종료 시점 감지
             fprintf(stderr,"Predicted FEMU exit after 300 seconds\n");
             femu_exit(ssd);
         }
-
+    while (1) {
         for (i = 1; i <= n->nr_pollers; i++) {
             if (!ssd->to_ftl[i] || !femu_ring_count(ssd->to_ftl[i]))
                 continue;
