@@ -1,32 +1,32 @@
 #include "ftl.h"
 #include <stdint.h> // for uint64_t
-#include <stdio.h> // for fprintf
 #include <time.h> // for time()
-
 static time_t default_time = 0;
+uint64_t *access_count_table = NULL;
 // 로그를 위한 시간 기반 트리거
-static time_t last_second = 0;
 static time_t last_ten_seconds = 0;
 static uint64_t IOPS = 0;
-static uint64_t throughput = 0;
-static uint64_t erased_blocks = 0;
-static uint64_t valid_pages_moved = 0;
+static uint64_t user_write = 0;
+static uint64_t gc_write = 0;
 
+uint64_t hot_cold_threshold =0;
 // IOPS, 처리량을 매 초마다, GC와 valid_page 이동횟수 출력하는 헬퍼 함수
 static void print_log(void) {
     time_t current_time = time(NULL);
-    if (current_time > last_second) { // 1초가 경과했을 때
-        fprintf(stderr, "%ld,%lu,%.2f,%lu,%lu\n", current_time - default_time, IOPS, throughput / 1024.0 / 1024.0, erased_blocks, valid_pages_moved);
-        // 다음 간격을 위해 카운터 리셋
+    if (current_time - last_ten_seconds >= 10){
+        double waf = (double)(user_write + gc_write) / user_write;
+        fprintf(stderr, "%ld,%lu,%.8f\n", current_time - default_time, IOPS, waf);
         IOPS = 0;
-        throughput = 0;
-        last_second = current_time;
-        // 다음 간격을 위해 지워진 블록 수 리셋
-        if (current_time - last_ten_seconds >= 10){
-            erased_blocks = 0;
-            valid_pages_moved = 0;
-            last_ten_seconds = current_time;
-        }
+        user_write = 0;
+        gc_write = 0;
+        last_ten_seconds = current_time;
+    }
+}
+static void ssd_init_access_count_table(struct ssd *ssd) {
+    access_count_table = calloc(ssd->sp.tt_pgs, sizeof(uint64_t));
+    if (!access_count_table) {
+        ftl_err("Failed to allocate memory for access count table\n");
+        abort();
     }
 }
 
@@ -144,30 +144,6 @@ static void ssd_init_lines(struct ssd *ssd)
     lm->full_line_cnt = 0;
 }
 
-static void ssd_init_write_pointer(struct ssd *ssd)
-{
-    struct write_pointer *wpp = &ssd->wp;
-    struct line_mgmt *lm = &ssd->lm;
-    struct line *curline = NULL;
-
-    curline = QTAILQ_FIRST(&lm->free_line_list);
-    QTAILQ_REMOVE(&lm->free_line_list, curline, entry);
-    lm->free_line_cnt--;
-
-    /* wpp->curline is always our next-to-write super-block */
-    wpp->curline = curline;
-    wpp->ch = 0;
-    wpp->lun = 0;
-    wpp->pg = 0;
-    wpp->blk = 0;
-    wpp->pl = 0;
-}
-
-static inline void check_addr(int a, int max)
-{
-    ftl_assert(a >= 0 && a < max);
-}
-
 static struct line *get_next_free_line(struct ssd *ssd)
 {
     struct line_mgmt *lm = &ssd->lm;
@@ -184,10 +160,31 @@ static struct line *get_next_free_line(struct ssd *ssd)
     return curline;
 }
 
-static void ssd_advance_write_pointer(struct ssd *ssd)
+static void ssd_init_write_pointer(struct ssd *ssd)
+{
+// Hot 쓰기 포인터 초기화
+    ssd->wp_hot.curline = get_next_free_line(ssd);
+    ssd->wp_hot.ch = 0;
+    ssd->wp_hot.lun = 0;
+    ssd->wp_hot.pg = 0;
+    ssd->wp_hot.blk = ssd->wp_hot.curline->id;
+
+// Cold 쓰기 포인터 초기화 
+    ssd->wp_cold.curline = get_next_free_line(ssd);
+    ssd->wp_cold.ch = 0;
+    ssd->wp_cold.lun = 0;
+    ssd->wp_cold.pg = 0;
+    ssd->wp_cold.blk = ssd->wp_cold.curline->id;
+}
+
+static inline void check_addr(int a, int max)
+{
+    ftl_assert(a >= 0 && a < max);
+}
+
+static void ssd_advance_write_pointer(struct ssd *ssd, struct write_pointer *wpp)
 {
     struct ssdparams *spp = &ssd->sp;
-    struct write_pointer *wpp = &ssd->wp;
     struct line_mgmt *lm = &ssd->lm;
 
     check_addr(wpp->ch, spp->nchs);
@@ -238,16 +235,15 @@ static void ssd_advance_write_pointer(struct ssd *ssd)
     }
 }
 
-static struct ppa get_new_page(struct ssd *ssd)
+static struct ppa get_new_page(struct ssd *ssd, struct write_pointer *current_wp)
 {
-    struct write_pointer *wpp = &ssd->wp;
     struct ppa ppa;
     ppa.ppa = 0;
-    ppa.g.ch = wpp->ch;
-    ppa.g.lun = wpp->lun;
-    ppa.g.pg = wpp->pg;
-    ppa.g.blk = wpp->blk;
-    ppa.g.pl = wpp->pl;
+    ppa.g.ch = current_wp->ch;
+    ppa.g.lun = current_wp->lun;
+    ppa.g.pg = current_wp->pg;
+    ppa.g.blk = current_wp->blk;
+    ppa.g.pl = current_wp->pl;
     ftl_assert(ppa.g.pl == 0);
 
     return ppa;
@@ -407,7 +403,8 @@ void ssd_init(FemuCtrl *n)
 
     /* initialize maptbl */
     ssd_init_maptbl(ssd);
-
+// 추가한: LPN 접근 횟수 테이블 초기화작업
+    ssd_init_access_count_table(ssd);
     /* initialize rmap */
     ssd_init_rmap(ssd);
 
@@ -642,8 +639,6 @@ static void mark_block_free(struct ssd *ssd, struct ppa *ppa)
     blk->ipc = 0;
     blk->vpc = 0;
     blk->erase_cnt++;
-    erased_blocks++;
-    print_log();
 }
 
 static void gc_read_page(struct ssd *ssd, struct ppa *ppa)
@@ -664,9 +659,16 @@ static uint64_t gc_write_page(struct ssd *ssd, struct ppa *old_ppa)
     struct ppa new_ppa;
     struct nand_lun *new_lun;
     uint64_t lpn = get_rmap_ent(ssd, old_ppa);
+// gc에서는 cnt++없이 hot/cold만 이용
+    struct write_pointer *current_wp;
+    if (access_count_table[lpn] >= hot_cold_threshold) {
+        current_wp = &ssd->wp_hot; // Hot 쓰기 포인터 사용
+    } else {
+        current_wp = &ssd->wp_cold; // Cold 쓰기 포인터 사용
+    }
 
     ftl_assert(valid_lpn(ssd, lpn));
-    new_ppa = get_new_page(ssd);
+    new_ppa = get_new_page(ssd, current_wp);
     /* update maptbl */
     set_maptbl_ent(ssd, lpn, &new_ppa);
     /* update rmap */
@@ -675,11 +677,11 @@ static uint64_t gc_write_page(struct ssd *ssd, struct ppa *old_ppa)
     mark_page_valid(ssd, &new_ppa);
     
     /* Increment the valid pages moved counter 이부분만 추가*/ 
-    valid_pages_moved++;
+    gc_write++;
     print_log();
 
-    /* need to advance the write pointer here */
-    ssd_advance_write_pointer(ssd);
+// 수정된 advance
+    ssd_advance_write_pointer(ssd, current_wp);
 
     if (ssd->sp.enable_gc_delay) {
         struct nand_cmd gcw;
@@ -836,7 +838,6 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
         maxlat = (sublat > maxlat) ? sublat : maxlat;
     }
     IOPS++;
-    throughput += req->nlb * ssd->sp.secsz;
     print_log();
     return maxlat;
 }
@@ -863,17 +864,27 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         if (r == -1)
             break;
     }
-
+// cnt++
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+        if (access_count_table)
+            access_count_table[lpn]++;
+
         ppa = get_maptbl_ent(ssd, lpn);
         if (mapped_ppa(&ppa)) {
             /* update old page information first */
             mark_page_invalid(ssd, &ppa);
             set_rmap_ent(ssd, INVALID_LPN, &ppa);
         }
+// hot/cold 판단
+        struct write_pointer *current_wp;
+        if (access_count_table[lpn] >= hot_cold_threshold) {
+            current_wp = &ssd->wp_hot; // Hot write pointer
+        } else {
+            current_wp = &ssd->wp_cold; // Cold write pointer
+        }
 
         /* new write */
-        ppa = get_new_page(ssd);
+        ppa = get_new_page(ssd, current_wp);
         /* update maptbl */
         set_maptbl_ent(ssd, lpn, &ppa);
         /* update rmap */
@@ -882,7 +893,7 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         mark_page_valid(ssd, &ppa);
 
         /* need to advance the write pointer here */
-        ssd_advance_write_pointer(ssd);
+        ssd_advance_write_pointer(ssd, current_wp);
 
         struct nand_cmd swr;
         swr.type = USER_IO;
@@ -893,7 +904,7 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         maxlat = (curlat > maxlat) ? curlat : maxlat;
     }
     IOPS++;
-    throughput += req->nlb * ssd->sp.secsz;
+    user_write += req->nlb / spp->secs_per_pg;
     print_log();
     return maxlat;
 }
@@ -956,6 +967,6 @@ static void *ftl_thread(void *arg)
             }
         }
     }
-
     return NULL;
 }
+// free(access_count_table);
